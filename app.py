@@ -73,6 +73,7 @@ def analyze(df: pd.DataFrame, length: int, pct_lookback: int) -> dict:
     
     last_close = float(env["close"].iloc[-1])
     last_range = float(env["range"].iloc[-1])
+    prev_range = float(env["range"].iloc[-2]) # Check yesterday's range
     range_pct = (last_range / last_close) * 100 if last_close else np.nan
     
     hist = env["range"].dropna().iloc[-pct_lookback:]
@@ -86,8 +87,10 @@ def analyze(df: pd.DataFrame, length: int, pct_lookback: int) -> dict:
         "volatility_percentile": round(pct_rank, 1) if not np.isnan(pct_rank) else None,
         "contracting": bool(pine_falling(env["range"], length)),
         "wedge": bool(pine_rising(env["smooth2"], wedge_len) and pine_falling(env["smooth"], wedge_len)),
+        "is_tightening": bool(last_range < prev_range), # TRUE if actively squeezing today
         "as_of": str(env.index[-1]),
     }
+
 
 # ==========================================
 # 3. DATA FETCHING
@@ -178,12 +181,18 @@ else:
     if search_q:
         view = view[view["symbol"].str.contains(search_q, case=False)]
     
+    # 1. Base filter: Must meet the max squeeze percentile
     view = view[view["volatility_percentile"].notna() & (view["volatility_percentile"] <= pct_max)]
+    
+    # 2. PREMIUM FILTER: Remove stocks that have passed the stage (range is expanding)
+    # The stock must be actively tightening on the latest candle, or firing a strict coil signal
+    view = view[view["is_tightening"] | view["contracting"] | view["wedge"]]
+    
     if req_contracting: view = view[view["contracting"]]
     if req_wedge: view = view[view["wedge"]]
     
     if view.empty:
-        st.warning("No stocks match the current filters.")
+        st.warning("No stocks match the current filters. All tight setups have already broken out.")
     else:
         # Generate Signals
         def get_signal(row):
