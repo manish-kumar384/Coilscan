@@ -4,3 +4,4 @@ pandas
 numpy
 lxml
 html5lib
+Pillow>=10.2.0
