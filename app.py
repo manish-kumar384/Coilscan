@@ -220,58 +220,60 @@ else:
         st.dataframe(display_view, width="stretch", hide_index=True)
         
         # ==========================================
-        # 5. CHART VISUALIZATION TOOL
+        # 5. TRADINGVIEW-STYLE CHART
         # ==========================================
         st.divider()
         st.subheader("📊 Cross-Verify Pattern")
         
-        # Create a dropdown from the filtered results
+        # Import the TradingView Streamlit wrapper
+        from lightweight_charts.widgets import StreamlitChart
+        
         symbol_options = view["symbol"].unique()
         selected_chart_sym = st.selectbox("Select a symbol to plot its resistance ceiling:", symbol_options)
         
         if selected_chart_sym:
-            # Find the timeframe that triggered the signal for this symbol
             trigger_tf = view[view["symbol"] == selected_chart_sym]["timeframe"].iloc[0]
             
-            with st.spinner("Loading chart data..."):
+            with st.spinner("Loading TradingView engine..."):
                 chart_df = fetch_ohlc(selected_chart_sym, trigger_tf)
                 chart_env = compute_envelope(chart_df, INDICATOR_LENGTH)
                 
-                # Plotly Chart
-                fig = go.Figure()
+                # TradingView requires a specific format: a 'time' column and lowercase OHLC columns
+                tv_df = chart_df.reset_index()
+                # Rename whatever the first column is (Date/Datetime) to 'time'
+                tv_df = tv_df.rename(columns={
+                    tv_df.columns[0]: 'time', 
+                    'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'volume'
+                })
                 
-                # 1. Candlesticks
-                fig.add_trace(go.Candlestick(
-                    x=chart_df.index, open=chart_df['Open'], high=chart_df['High'], 
-                    low=chart_df['Low'], close=chart_df['Close'], name='Price'
-                ))
+                # Initialize the TradingView Chart (Dark mode by default)
+                chart = StreamlitChart(width=900, height=550)
                 
-                # 2. Envelope Bands (The blue lines)
-                fig.add_trace(go.Scatter(x=chart_env.index, y=chart_env['smooth'], line=dict(color='rgba(0,150,255,0.6)', width=1.5), name='Upper Envelope'))
-                fig.add_trace(go.Scatter(x=chart_env.index, y=chart_env['smooth2'], line=dict(color='rgba(0,150,255,0.6)', width=1.5), name='Lower Envelope'))
+                # 1. Load the Candlesticks
+                chart.set(tv_df)
                 
-                # 3. Flat-Top Resistance Ceiling (The horizontal blue line from your image)
+                # 2. Add Upper Envelope (Blue Line)
+                upper_line = chart.create_line(name="Upper Envelope", color='rgba(0,150,255,0.8)', width=2)
+                upper_data = pd.DataFrame({'time': tv_df['time'], 'value': chart_env['smooth'].values}).dropna()
+                upper_line.set(upper_data)
+                
+                # 3. Add Lower Envelope (Blue Line)
+                lower_line = chart.create_line(name="Lower Envelope", color='rgba(0,150,255,0.8)', width=2)
+                lower_data = pd.DataFrame({'time': tv_df['time'], 'value': chart_env['smooth2'].values}).dropna()
+                lower_line.set(lower_data)
+                
+                # 4. Add Flat-Top Resistance Ceiling (Red Line)
                 N_bars = TF_SETTINGS.get(trigger_tf)[0]
-                if len(chart_df) >= N_bars:
-                    recent_df = chart_df.iloc[-N_bars:]
-                    period_high = recent_df["High"].max()
+                if len(tv_df) >= N_bars:
+                    period_high = float(tv_df.iloc[-N_bars:]['high'].max())
+                    res_line = chart.create_line(name="Resistance Ceiling", color='rgba(255, 0, 0, 0.8)', width=2)
                     
-                    fig.add_trace(go.Scatter(
-                        x=[recent_df.index[0], recent_df.index[-1]], 
-                        y=[period_high, period_high],
-                        mode='lines',
-                        line=dict(color='red', width=2, dash='dash'),
-                        name='Resistance Ceiling'
-                    ))
+                    # Draw the ceiling line across the recent lookback window
+                    res_data = pd.DataFrame({
+                        'time': tv_df['time'].iloc[-N_bars:], 
+                        'value': [period_high] * N_bars
+                    })
+                    res_line.set(res_data)
                 
-                fig.update_layout(
-                    title=f"{selected_chart_sym} - {trigger_tf} Timeframe",
-                    yaxis_title="Price",
-                    xaxis_rangeslider_visible=False,
-                    height=550,
-                    template="plotly_dark",
-                    margin=dict(l=20, r=20, t=50, b=20)
-                )
-                
-                # Render the chart natively in the Streamlit app
-                st.plotly_chart(fig, use_container_width=True)
+                # Render the buttery-smooth chart
+                chart.load()
