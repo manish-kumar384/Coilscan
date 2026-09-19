@@ -225,7 +225,6 @@ else:
         st.divider()
         st.subheader("📊 Cross-Verify Pattern")
         
-        # Import the TradingView Streamlit wrapper
         from lightweight_charts.widgets import StreamlitChart
         
         symbol_options = view["symbol"].unique()
@@ -238,42 +237,35 @@ else:
                 chart_df = fetch_ohlc(selected_chart_sym, trigger_tf)
                 chart_env = compute_envelope(chart_df, INDICATOR_LENGTH)
                 
-                # TradingView requires a specific format: a 'time' column and lowercase OHLC columns
                 tv_df = chart_df.reset_index()
-                # Rename whatever the first column is (Date/Datetime) to 'time'
                 tv_df = tv_df.rename(columns={
                     tv_df.columns[0]: 'time', 
                     'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'volume'
                 })
                 
-                # Initialize the TradingView Chart (Dark mode by default)
                 chart = StreamlitChart(width=900, height=550)
-                
-                # 1. Load the Candlesticks
                 chart.set(tv_df)
                 
-                # 2. Add Upper Envelope (Blue Line)
+                # 2. Add Upper Envelope (Column name must match line name)
                 upper_line = chart.create_line(name="Upper Envelope", color='rgba(0,150,255,0.8)', width=2)
-                upper_data = pd.DataFrame({'time': tv_df['time'], 'value': chart_env['smooth'].values}).dropna()
+                upper_data = pd.DataFrame({'time': tv_df['time'], 'Upper Envelope': chart_env['smooth'].values}).dropna()
                 upper_line.set(upper_data)
                 
-                # 3. Add Lower Envelope (Blue Line)
+                # 3. Add Lower Envelope (Column name must match line name)
                 lower_line = chart.create_line(name="Lower Envelope", color='rgba(0,150,255,0.8)', width=2)
-                lower_data = pd.DataFrame({'time': tv_df['time'], 'value': chart_env['smooth2'].values}).dropna()
+                lower_data = pd.DataFrame({'time': tv_df['time'], 'Lower Envelope': chart_env['smooth2'].values}).dropna()
                 lower_line.set(lower_data)
                 
-                # 4. Add Flat-Top Resistance Ceiling (Red Line)
+                # 4. Add Flat-Top Resistance Ceiling (Column name must match line name)
                 N_bars = TF_SETTINGS.get(trigger_tf)[0]
                 if len(tv_df) >= N_bars:
                     period_high = float(tv_df.iloc[-N_bars:]['high'].max())
                     res_line = chart.create_line(name="Resistance Ceiling", color='rgba(255, 0, 0, 0.8)', width=2)
                     
-                    # Draw the ceiling line across the recent lookback window
                     res_data = pd.DataFrame({
                         'time': tv_df['time'].iloc[-N_bars:], 
-                        'value': [period_high] * N_bars
+                        'Resistance Ceiling': [period_high] * N_bars
                     })
                     res_line.set(res_data)
                 
-                # Render the buttery-smooth chart
                 chart.load()
