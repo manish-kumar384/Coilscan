@@ -4,4 +4,4 @@ pandas
 numpy
 lxml
 html5lib
-plotly
+lightweight-charts
