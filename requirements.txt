@@ -1,7 +1,7 @@
-streamlit==1.32.0
+streamlit
 yfinance
 pandas
 numpy
 lxml
 html5lib
-Pillow>=10.2.0
+plotly
