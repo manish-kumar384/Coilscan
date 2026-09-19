@@ -71,29 +71,48 @@ def compute_envelope(df: pd.DataFrame, length: int = 20) -> pd.DataFrame:
     smooth2 = ema(pd.concat([close, lower], axis=1).min(axis=1), length)
     return pd.DataFrame({"close": close, "range": smooth - smooth2, "smooth": smooth, "smooth2": smooth2}, index=df.index)
 
-def analyze(df: pd.DataFrame, length: int, pct_lookback: int) -> dict:
+def analyze(df: pd.DataFrame, length: int, pct_lookback: int, tf: str) -> dict:
     env = compute_envelope(df, length)
     if len(env) < length + 5: return {"status": "insufficient_data"}
     
     last_close = float(env["close"].iloc[-1])
     last_range = float(env["range"].iloc[-1])
     
-    # Calculate historical percentile
+    # --- 1. EXISTING PERCENTILE CALC ---
     hist = env["range"].dropna().iloc[-pct_lookback:]
     pct_rank = float((hist < last_range).sum()) / len(hist) * 100 if len(hist) >= 10 else np.nan
     
-    # NEW STRICT BUILD-UP CHECKS:
-    # 1. Is price trapped inside the bands? (Hasn't broken out yet)
-    upper_band = float(env["smooth"].iloc[-1])
-    lower_band = float(env["smooth2"].iloc[-1])
-    is_contained = bool(lower_band < last_close < upper_band)
+    # --- 2. DYNAMIC TIMEFRAME LOOKBACK (Flat-Top Build-Up) ---
+    # Maps timeframe to: (Candles Lookback, Max Base Width %, Max Distance to Ceiling %)
+    # 15m (10 bars = 2.5 hrs), 30m (6 bars = 3 hrs), 1d (5 bars = 5 days)
+    tf_settings = {
+        "15m": (10, 2.0, 0.5),
+        "30m": (6,  2.0, 0.5),
+        "1h":  (4,  3.0, 0.8),
+        "4h":  (4,  4.0, 1.2),
+        "1d":  (5,  6.0, 1.5),
+        "1wk": (4,  8.0, 2.0)
+    }
     
-    # 2. Is today's candle small/quiet? (Compare today's range to 14-day ATR)
-    df["tr"] = df["High"] - df["Low"]
-    atr_14 = float(df["tr"].ewm(span=14, adjust=False).mean().iloc[-1])
-    today_candle_size = float(df["tr"].iloc[-1])
-    is_quiet_today = bool(today_candle_size <= atr_14)
+    N_bars, max_width_pct, max_dist_pct = tf_settings.get(tf, (5, 5.0, 1.5))
     
+    if len(df) >= N_bars:
+        recent_df = df.iloc[-N_bars:]
+        period_high = float(recent_df["High"].max())
+        period_low = float(recent_df["Low"].min())
+        
+        # Check 1: Is the total range of this period tight? (Prevents wild, choppy bases)
+        base_width_pct = ((period_high - period_low) / period_low) * 100
+        is_tight_base = base_width_pct <= max_width_pct
+        
+        # Check 2: Is the price pressing against the ceiling? (The blue line in your image)
+        dist_to_ceiling_pct = ((period_high - last_close) / period_high) * 100
+        is_pushing_resistance = dist_to_ceiling_pct <= max_dist_pct
+        
+        is_flat_top_buildup = bool(is_tight_base and is_pushing_resistance)
+    else:
+        is_flat_top_buildup = False
+
     wedge_len = max(1, length // 5)
     return {
         "status": "ok",
@@ -102,10 +121,10 @@ def analyze(df: pd.DataFrame, length: int, pct_lookback: int) -> dict:
         "volatility_percentile": round(pct_rank, 1) if not np.isnan(pct_rank) else None,
         "contracting": bool(pine_falling(env["range"], length)),
         "wedge": bool(pine_rising(env["smooth2"], wedge_len) and pine_falling(env["smooth"], wedge_len)),
-        "is_contained": is_contained,     # Added to payload
-        "is_quiet_today": is_quiet_today, # Added to payload
+        "is_flat_top_buildup": is_flat_top_buildup, # NEW PREMIUM SIGNAL
         "as_of": str(env.index[-1]),
     }
+
 
 # ==========================================
 # 3. DATA FETCHING
@@ -142,7 +161,8 @@ def run_scan(symbols, timeframes):
         try:
             df = fetch_ohlc(sym, tf)
             if not df.empty:
-                res = analyze(df, INDICATOR_LENGTH, PCT_LOOKBACK)
+                # Add the 'tf' parameter to the end of this function call
+                res = analyze(df, INDICATOR_LENGTH, PCT_LOOKBACK, tf)
                 if res.get("status") == "ok":
                     res.update({"symbol": sym, "timeframe": tf})
                     rows.append(res)
@@ -199,16 +219,16 @@ else:
     # 1. Base filter: Must meet the maximum squeeze percentile
     view = view[view["volatility_percentile"].notna() & (view["volatility_percentile"] <= pct_max)]
     
-    # 2. PREMIUM BUILD-UP FILTER: 
-    # Must be trapped inside the bands AND today's candle must be quiet (no breakout yet)
-    view = view[view["is_contained"] & view["is_quiet_today"]]
+    # 2. PREMIUM FLAT-TOP FILTER (From Image Analysis)
+    # The stock must be holding a tight base and closing right against the ceiling
+    view = view[view["is_flat_top_buildup"] == True]
     
     # 3. User toggles
     if req_contracting: view = view[view["contracting"]]
     if req_wedge: view = view[view["wedge"]]
     
     if view.empty:
-        st.warning("No stocks match the criteria. All tight setups have already broken out or failed the strict build-up check.")
+        st.warning("No stocks match the criteria. Currently, no symbols are showing a tight flat-top resistance build-up.")
     else:
         # Generate Signals
         def get_signal(row):
