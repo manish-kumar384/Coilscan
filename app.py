@@ -27,22 +27,26 @@ TIMEFRAME_MAP = {
     "1wk": {"interval": "1wk", "period": "10y"},
 }
 
-@st.cache_data(ttl=3600) # Caches the watchlist for an hour so we don't spam Wikipedia
-def fetch_nifty50_tickers():
+@st.cache_data(ttl=86400) # Caches for 24 hours
+def fetch_nifty500_tickers():
     try:
-        url = "https://en.wikipedia.org/wiki/NIFTY_50"
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        # Fetch directly from NSE official archives
+        url = "https://archives.nseindia.com/content/indices/ind_nifty500list.csv"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
         with urllib.request.urlopen(req) as response:
-            html = response.read()
-        tables = pd.read_html(html)
-        for df in tables:
-            cols = [str(c).strip().lower() for c in df.columns]
-            if 'symbol' in cols:
-                return [str(sym).strip() for sym in df.iloc[:, cols.index('symbol')].tolist() if pd.notna(sym)]
+            df = pd.read_csv(response)
+        
+        # Ensure we get the Symbol column
+        if 'Symbol' in df.columns:
+            return [str(sym).strip() for sym in df['Symbol'].tolist() if pd.notna(sym)]
+        else:
+            raise KeyError("Symbol column not found")
     except Exception as e:
-        return ["RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK"] # Fallback
+        st.sidebar.error("Failed to load Nifty 500 from NSE. Using fallback list.")
+        return ["RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "SBIN", "TATAMOTORS"] # Fallback
 
-WATCHLIST = fetch_nifty50_tickers()
+WATCHLIST = fetch_nifty500_tickers()
+
 
 # ==========================================
 # 2. INDICATOR LOGIC
@@ -73,24 +77,35 @@ def analyze(df: pd.DataFrame, length: int, pct_lookback: int) -> dict:
     
     last_close = float(env["close"].iloc[-1])
     last_range = float(env["range"].iloc[-1])
-    prev_range = float(env["range"].iloc[-2]) # Check yesterday's range
-    range_pct = (last_range / last_close) * 100 if last_close else np.nan
     
+    # Calculate historical percentile
     hist = env["range"].dropna().iloc[-pct_lookback:]
     pct_rank = float((hist < last_range).sum()) / len(hist) * 100 if len(hist) >= 10 else np.nan
+    
+    # NEW STRICT BUILD-UP CHECKS:
+    # 1. Is price trapped inside the bands? (Hasn't broken out yet)
+    upper_band = float(env["smooth"].iloc[-1])
+    lower_band = float(env["smooth2"].iloc[-1])
+    is_contained = bool(lower_band < last_close < upper_band)
+    
+    # 2. Is today's candle small/quiet? (Compare today's range to 14-day ATR)
+    df["tr"] = df["High"] - df["Low"]
+    atr_14 = float(df["tr"].ewm(span=14, adjust=False).mean().iloc[-1])
+    today_candle_size = float(df["tr"].iloc[-1])
+    is_quiet_today = bool(today_candle_size <= atr_14)
     
     wedge_len = max(1, length // 5)
     return {
         "status": "ok",
         "last_close": round(last_close, 2),
-        "range_pct": round(range_pct, 3) if not np.isnan(range_pct) else None,
+        "range_pct": round((last_range / last_close) * 100, 3) if last_close else None,
         "volatility_percentile": round(pct_rank, 1) if not np.isnan(pct_rank) else None,
         "contracting": bool(pine_falling(env["range"], length)),
         "wedge": bool(pine_rising(env["smooth2"], wedge_len) and pine_falling(env["smooth"], wedge_len)),
-        "is_tightening": bool(last_range < prev_range), # TRUE if actively squeezing today
+        "is_contained": is_contained,     # Added to payload
+        "is_quiet_today": is_quiet_today, # Added to payload
         "as_of": str(env.index[-1]),
     }
-
 
 # ==========================================
 # 3. DATA FETCHING
@@ -181,18 +196,19 @@ else:
     if search_q:
         view = view[view["symbol"].str.contains(search_q, case=False)]
     
-    # 1. Base filter: Must meet the max squeeze percentile
+    # 1. Base filter: Must meet the maximum squeeze percentile
     view = view[view["volatility_percentile"].notna() & (view["volatility_percentile"] <= pct_max)]
     
-    # 2. PREMIUM FILTER: Remove stocks that have passed the stage (range is expanding)
-    # The stock must be actively tightening on the latest candle, or firing a strict coil signal
-    view = view[view["is_tightening"] | view["contracting"] | view["wedge"]]
+    # 2. PREMIUM BUILD-UP FILTER: 
+    # Must be trapped inside the bands AND today's candle must be quiet (no breakout yet)
+    view = view[view["is_contained"] & view["is_quiet_today"]]
     
+    # 3. User toggles
     if req_contracting: view = view[view["contracting"]]
     if req_wedge: view = view[view["wedge"]]
     
     if view.empty:
-        st.warning("No stocks match the current filters. All tight setups have already broken out.")
+        st.warning("No stocks match the criteria. All tight setups have already broken out or failed the strict build-up check.")
     else:
         # Generate Signals
         def get_signal(row):
