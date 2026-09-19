@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import urllib.request
 from datetime import datetime
+import plotly.graph_objects as go
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -27,26 +28,30 @@ TIMEFRAME_MAP = {
     "1wk": {"interval": "1wk", "period": "10y"},
 }
 
-@st.cache_data(ttl=86400) # Caches for 24 hours
+# Settings for the Flat-Top Build-up: (Candles Lookback, Max Base Width %, Max Distance to Ceiling %)
+TF_SETTINGS = {
+    "15m": (10, 2.0, 0.5),
+    "30m": (6,  2.0, 0.5),
+    "1h":  (4,  3.0, 0.8),
+    "4h":  (4,  4.0, 1.2),
+    "1d":  (5,  6.0, 1.5),
+    "1wk": (4,  8.0, 2.0)
+}
+
+@st.cache_data(ttl=86400)
 def fetch_nifty500_tickers():
     try:
-        # Fetch directly from NSE official archives
         url = "https://archives.nseindia.com/content/indices/ind_nifty500list.csv"
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req) as response:
             df = pd.read_csv(response)
-        
-        # Ensure we get the Symbol column
         if 'Symbol' in df.columns:
-            return [str(sym).strip() for sym in df['Symbol'].tolist() if pd.notna(sym)]
-        else:
-            raise KeyError("Symbol column not found")
-    except Exception as e:
-        st.sidebar.error("Failed to load Nifty 500 from NSE. Using fallback list.")
-        return ["RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "SBIN", "TATAMOTORS"] # Fallback
+            # FIX: Filter out 'DUMMY' and NaN symbols to prevent Yahoo Finance spam
+            return [str(sym).strip() for sym in df['Symbol'].tolist() if pd.notna(sym) and 'DUMMY' not in str(sym)]
+    except Exception:
+        return ["RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK"]
 
 WATCHLIST = fetch_nifty500_tickers()
-
 
 # ==========================================
 # 2. INDICATOR LOGIC
@@ -78,34 +83,18 @@ def analyze(df: pd.DataFrame, length: int, pct_lookback: int, tf: str) -> dict:
     last_close = float(env["close"].iloc[-1])
     last_range = float(env["range"].iloc[-1])
     
-    # --- 1. EXISTING PERCENTILE CALC ---
     hist = env["range"].dropna().iloc[-pct_lookback:]
     pct_rank = float((hist < last_range).sum()) / len(hist) * 100 if len(hist) >= 10 else np.nan
     
-    # --- 2. DYNAMIC TIMEFRAME LOOKBACK (Flat-Top Build-Up) ---
-    # Maps timeframe to: (Candles Lookback, Max Base Width %, Max Distance to Ceiling %)
-    # 15m (10 bars = 2.5 hrs), 30m (6 bars = 3 hrs), 1d (5 bars = 5 days)
-    tf_settings = {
-        "15m": (10, 2.0, 0.5),
-        "30m": (6,  2.0, 0.5),
-        "1h":  (4,  3.0, 0.8),
-        "4h":  (4,  4.0, 1.2),
-        "1d":  (5,  6.0, 1.5),
-        "1wk": (4,  8.0, 2.0)
-    }
-    
-    N_bars, max_width_pct, max_dist_pct = tf_settings.get(tf, (5, 5.0, 1.5))
+    N_bars, max_width_pct, max_dist_pct = TF_SETTINGS.get(tf, (5, 5.0, 1.5))
     
     if len(df) >= N_bars:
         recent_df = df.iloc[-N_bars:]
         period_high = float(recent_df["High"].max())
         period_low = float(recent_df["Low"].min())
         
-        # Check 1: Is the total range of this period tight? (Prevents wild, choppy bases)
         base_width_pct = ((period_high - period_low) / period_low) * 100
         is_tight_base = base_width_pct <= max_width_pct
-        
-        # Check 2: Is the price pressing against the ceiling? (The blue line in your image)
         dist_to_ceiling_pct = ((period_high - last_close) / period_high) * 100
         is_pushing_resistance = dist_to_ceiling_pct <= max_dist_pct
         
@@ -121,23 +110,19 @@ def analyze(df: pd.DataFrame, length: int, pct_lookback: int, tf: str) -> dict:
         "volatility_percentile": round(pct_rank, 1) if not np.isnan(pct_rank) else None,
         "contracting": bool(pine_falling(env["range"], length)),
         "wedge": bool(pine_rising(env["smooth2"], wedge_len) and pine_falling(env["smooth"], wedge_len)),
-        "is_flat_top_buildup": is_flat_top_buildup, # NEW PREMIUM SIGNAL
+        "is_flat_top_buildup": is_flat_top_buildup,
         "as_of": str(env.index[-1]),
     }
 
-
-# ==========================================
-# 3. DATA FETCHING
-# ==========================================
 # ==========================================
 # 3. DATA FETCHING
 # ==========================================
 def to_yahoo_symbol(symbol: str) -> str:
     return symbol if "." in symbol else f"{symbol}{EXCHANGE_SUFFIX}"
 
+@st.cache_data(ttl=300)
 def fetch_ohlc(symbol: str, timeframe: str) -> pd.DataFrame:
     cfg = TIMEFRAME_MAP[timeframe]
-    # Restored exact parameters from the Colab notebook to prevent formatting errors
     df = yf.download(
         to_yahoo_symbol(symbol), 
         interval=cfg["interval"], 
@@ -161,20 +146,17 @@ def run_scan(symbols, timeframes):
         try:
             df = fetch_ohlc(sym, tf)
             if not df.empty:
-                # Add the 'tf' parameter to the end of this function call
                 res = analyze(df, INDICATOR_LENGTH, PCT_LOOKBACK, tf)
                 if res.get("status") == "ok":
                     res.update({"symbol": sym, "timeframe": tf})
                     rows.append(res)
-        except Exception as e:
-            # Replaced the silent 'pass' so any future errors are printed to the screen
-            st.toast(f"Skipped {sym} ({tf}): Data format error", icon="⚠️")
+        except Exception:
+            pass # Suppressed error handling for a cleaner UI
             
         progress_bar.progress((i + 1) / total)
         
     progress_bar.empty()
     return pd.DataFrame(rows)
-
 
 # ==========================================
 # 4. STREAMLIT UI
@@ -182,16 +164,15 @@ def run_scan(symbols, timeframes):
 st.title("📉 CoilScan — Live Volatility Scanner")
 st.markdown("Live scan across multiple timeframes for volatility contractions and squeezes.")
 
-# Initialize Session State to hold data between UI clicks
 if "scan_data" not in st.session_state:
     st.session_state.scan_data = pd.DataFrame()
 
-# Sidebar Filters
 with st.sidebar:
     st.header("⚙️ Scanner Settings")
     selected_tfs = st.multiselect("Timeframes", ALL_TIMEFRAMES, default=["1d"])
     
-    if st.button("🔄 Run Live Scan", type="primary", use_container_width=True):
+    # FIX: Replaced use_container_width with width="stretch" to clear the deprecation warning
+    if st.button("🔄 Run Live Scan", type="primary", width="stretch"):
         with st.spinner(f"Scanning {len(WATCHLIST)} symbols..."):
             st.session_state.scan_data = run_scan(WATCHLIST, selected_tfs)
             st.session_state.last_run = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -203,7 +184,6 @@ with st.sidebar:
     req_contracting = st.checkbox("Require contracting 🟢")
     req_wedge = st.checkbox("Require wedge (coil) 🟣")
 
-# Main Display
 df = st.session_state.scan_data
 
 if df.empty:
@@ -211,26 +191,21 @@ if df.empty:
 else:
     st.caption(f"Last scan: {st.session_state.get('last_run', 'N/A')}")
     
-    # Apply UI filters to the DataFrame
     view = df.copy()
     if search_q:
         view = view[view["symbol"].str.contains(search_q, case=False)]
     
-    # 1. Base filter: Must meet the maximum squeeze percentile
     view = view[view["volatility_percentile"].notna() & (view["volatility_percentile"] <= pct_max)]
     
-    # 2. PREMIUM FLAT-TOP FILTER (From Image Analysis)
-    # The stock must be holding a tight base and closing right against the ceiling
+    # The strict image-based flat-top filter
     view = view[view["is_flat_top_buildup"] == True]
     
-    # 3. User toggles
     if req_contracting: view = view[view["contracting"]]
     if req_wedge: view = view[view["wedge"]]
     
     if view.empty:
         st.warning("No stocks match the criteria. Currently, no symbols are showing a tight flat-top resistance build-up.")
     else:
-        # Generate Signals
         def get_signal(row):
             if row.get("wedge"): return "🟣 Coil (wedge)"
             if row.get("contracting"): return "🟢 Contracting"
@@ -238,19 +213,65 @@ else:
             
         view["Signal"] = view.apply(get_signal, axis=1)
         view = view.sort_values("volatility_percentile")
-        view = view[["symbol", "timeframe", "last_close", "range_pct", "volatility_percentile", "Signal", "as_of"]]
-        view.columns = ["Symbol", "Timeframe", "Last Close", "Envelope Width %", "Volatility Percentile", "Signal", "As Of"]
+        display_cols = ["symbol", "timeframe", "last_close", "range_pct", "volatility_percentile", "Signal", "as_of"]
+        display_view = view[display_cols].copy()
+        display_view.columns = ["Symbol", "Timeframe", "Last Close", "Envelope Width %", "Volatility Percentile", "Signal", "As Of"]
         
-        # Color formatting
-        def color_rows(row):
-            if "Coil" in row["Signal"]: return ["background-color: rgba(108,142,245,0.15)"] * len(row)
-            if "Contracting" in row["Signal"]: return ["background-color: rgba(53,196,136,0.12)"] * len(row)
-            return ["background-color: rgba(232,163,61,0.12)"] * len(row)
-
-        styled_df = view.style.apply(color_rows, axis=1).format({
-            "Last Close": "{:.2f}", 
-            "Envelope Width %": "{:.2f}%", 
-            "Volatility Percentile": "{:.1f}"
-        })
+        st.dataframe(display_view, width="stretch", hide_index=True)
         
-        st.dataframe(styled_df, use_container_width=True, hide_index=True, height=600)
+        # ==========================================
+        # 5. CHART VISUALIZATION TOOL
+        # ==========================================
+        st.divider()
+        st.subheader("📊 Cross-Verify Pattern")
+        
+        # Create a dropdown from the filtered results
+        symbol_options = view["symbol"].unique()
+        selected_chart_sym = st.selectbox("Select a symbol to plot its resistance ceiling:", symbol_options)
+        
+        if selected_chart_sym:
+            # Find the timeframe that triggered the signal for this symbol
+            trigger_tf = view[view["symbol"] == selected_chart_sym]["timeframe"].iloc[0]
+            
+            with st.spinner("Loading chart data..."):
+                chart_df = fetch_ohlc(selected_chart_sym, trigger_tf)
+                chart_env = compute_envelope(chart_df, INDICATOR_LENGTH)
+                
+                # Plotly Chart
+                fig = go.Figure()
+                
+                # 1. Candlesticks
+                fig.add_trace(go.Candlestick(
+                    x=chart_df.index, open=chart_df['Open'], high=chart_df['High'], 
+                    low=chart_df['Low'], close=chart_df['Close'], name='Price'
+                ))
+                
+                # 2. Envelope Bands (The blue lines)
+                fig.add_trace(go.Scatter(x=chart_env.index, y=chart_env['smooth'], line=dict(color='rgba(0,150,255,0.6)', width=1.5), name='Upper Envelope'))
+                fig.add_trace(go.Scatter(x=chart_env.index, y=chart_env['smooth2'], line=dict(color='rgba(0,150,255,0.6)', width=1.5), name='Lower Envelope'))
+                
+                # 3. Flat-Top Resistance Ceiling (The horizontal blue line from your image)
+                N_bars = TF_SETTINGS.get(trigger_tf)[0]
+                if len(chart_df) >= N_bars:
+                    recent_df = chart_df.iloc[-N_bars:]
+                    period_high = recent_df["High"].max()
+                    
+                    fig.add_trace(go.Scatter(
+                        x=[recent_df.index[0], recent_df.index[-1]], 
+                        y=[period_high, period_high],
+                        mode='lines',
+                        line=dict(color='red', width=2, dash='dash'),
+                        name='Resistance Ceiling'
+                    ))
+                
+                fig.update_layout(
+                    title=f"{selected_chart_sym} - {trigger_tf} Timeframe",
+                    yaxis_title="Price",
+                    xaxis_rangeslider_visible=False,
+                    height=550,
+                    template="plotly_dark",
+                    margin=dict(l=20, r=20, t=50, b=20)
+                )
+                
+                # Render the chart natively in the Streamlit app
+                st.plotly_chart(fig, use_container_width=True)
