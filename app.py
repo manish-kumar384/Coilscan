@@ -92,12 +92,23 @@ def analyze(df: pd.DataFrame, length: int, pct_lookback: int) -> dict:
 # ==========================================
 # 3. DATA FETCHING
 # ==========================================
+# ==========================================
+# 3. DATA FETCHING
+# ==========================================
 def to_yahoo_symbol(symbol: str) -> str:
     return symbol if "." in symbol else f"{symbol}{EXCHANGE_SUFFIX}"
 
 def fetch_ohlc(symbol: str, timeframe: str) -> pd.DataFrame:
     cfg = TIMEFRAME_MAP[timeframe]
-    df = yf.download(to_yahoo_symbol(symbol), interval=cfg["interval"], period=cfg["period"], progress=False)
+    # Restored exact parameters from the Colab notebook to prevent formatting errors
+    df = yf.download(
+        to_yahoo_symbol(symbol), 
+        interval=cfg["interval"], 
+        period=cfg["period"], 
+        auto_adjust=False, 
+        progress=False, 
+        multi_level_index=False
+    )
     if df is None or df.empty: return pd.DataFrame()
     df = df.dropna(how="all")
     if "resample" in cfg:
@@ -117,12 +128,15 @@ def run_scan(symbols, timeframes):
                 if res.get("status") == "ok":
                     res.update({"symbol": sym, "timeframe": tf})
                     rows.append(res)
-        except Exception:
-            pass
+        except Exception as e:
+            # Replaced the silent 'pass' so any future errors are printed to the screen
+            st.toast(f"Skipped {sym} ({tf}): Data format error", icon="⚠️")
+            
         progress_bar.progress((i + 1) / total)
         
     progress_bar.empty()
     return pd.DataFrame(rows)
+
 
 # ==========================================
 # 4. STREAMLIT UI
