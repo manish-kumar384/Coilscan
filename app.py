@@ -234,16 +234,23 @@ else:
             trigger_tf = view[view["symbol"] == selected_chart_sym]["timeframe"].iloc[0]
             
             with st.spinner("Loading TradingView engine..."):
+                # ... inside the with st.spinner("Loading TradingView engine..."): block
                 chart_df = fetch_ohlc(selected_chart_sym, trigger_tf)
                 chart_env = compute_envelope(chart_df, INDICATOR_LENGTH)
                 
+                # --- FIX: Strict Datetime Formatting ---
                 tv_df = chart_df.reset_index()
                 tv_df = tv_df.rename(columns={
                     tv_df.columns[0]: 'time', 
                     'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'volume'
                 })
                 
+                # Strip out any timezones and convert to the exact string format TradingView expects
+                tv_df['time'] = pd.to_datetime(tv_df['time']).dt.tz_localize(None).dt.strftime('%Y-%m-%d')
+                
                 chart = StreamlitChart(width=900, height=550)
+                # ... rest of the charting code remains the same ...
+
                 chart.set(tv_df)
                 
                 # 2. Add Upper Envelope (Column name must match line name)
